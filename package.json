@@ -1,0 +1,25 @@
+{
+  "name": "alt-notion-class-sync",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Securely sync Alt lecture transcripts into matching Notion class pages with Cloudflare Workers.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "wrangler dev --config wrangler.local.jsonc",
+    "deploy": "wrangler deploy --config wrangler.local.jsonc",
+    "tail": "wrangler tail --config wrangler.local.jsonc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260908.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0",
+    "wrangler": "^4.129.1"
+  }
+}

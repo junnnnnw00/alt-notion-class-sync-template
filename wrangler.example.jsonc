@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "alt-notion-class-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-08",
+  "workers_dev": true,
+  "keep_vars": true,
+  "vars": {
+    "NOTION_DATA_SOURCE_ID": "00000000-0000-0000-0000-000000000000",
+    "NOTION_DATE_PROPERTY": "일시",
+    "NOTION_CATEGORY_PROPERTY": "구분",
+    "NOTION_COURSE_PROPERTY": "과목",
+    "NOTION_TITLE_PROPERTY": "이름",
+    "NOTION_AUTO_NOTE_PROPERTY": "AI 자동 노트",
+    "CLASS_CATEGORY": "수업",
+    "TIME_ZONE": "Asia/Seoul",
+    "MATCH_WINDOW_MINUTES": "90",
+    "RECONCILE_LOOKBACK_HOURS": "48",
+    "RECONCILE_INTERVAL_MINUTES": "15",
+    "FULL_RECONCILE_INTERVAL_HOURS": "24"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SYNC_COORDINATOR",
+        "class_name": "SyncCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SyncCoordinator"]
+    }
+  ]
+}

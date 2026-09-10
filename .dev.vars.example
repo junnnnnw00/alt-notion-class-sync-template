@@ -1,0 +1,4 @@
+# Local development only. Never commit the real .dev.vars file.
+ALT_API_KEY="replace-with-alt-api-key"
+ALT_WEBHOOK_SECRET="replace-with-alt-webhook-signing-secret"
+NOTION_API_TOKEN="replace-with-notion-integration-token"
