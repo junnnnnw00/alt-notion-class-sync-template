@@ -15,10 +15,11 @@ The project isolates its writes: it does not create task statuses, it never rewr
 - Duplicate and out-of-order event protection using Alt revisions
 - A per-class `AI 자동 노트` checkbox
 - Transcript-only operation when no Alt summary exists
+- PDF-only curation when a recording was missed, with automatic enrichment if an Alt source appears later
 - Configurable Notion property labels and IANA time zone
 - Optional, separate Codex curation for polished class and course summaries
 - Optional class-page PDF reading, including later additions and replacements
-- An optional collapsed slide-preview gallery with one image for every PDF page
+- A continuous lecture note with every PDF page placed beside the explanation it supports
 
 ## Two independent layers
 
@@ -38,7 +39,7 @@ Alt recording ends
   → match by local date, course title, and class time
   → Notion class page / AI 수업 노트 / 원본 자료
   → optional Codex curation pass (+ current Notion `수업 자료` PDFs)
-  → polished note + collapsed `슬라이드 미리보기`
+  → polished note with context-aware inline slides
 ```
 
 ## Quick start
@@ -96,7 +97,9 @@ The Worker creates an `AI 수업 노트` heading when absent. It owns only the `
 
 The repository includes the reusable [`alt-notion-note-curator`](skills/alt-notion-note-curator/SKILL.md) skill. See [Codex workflow setup](docs/CODEX.md) for installation, a manual run, and a scheduled-task prompt. A safe run compares both the Alt revision marker and the byte fingerprint of current Notion PDFs, then makes no changes when neither changed.
 
-Alt's current public API exposes note metadata, transcripts, and summaries, but not raw PDF attachments. If a PDF must be read directly and cited by page, attach it once to the matching Notion class page's `수업 자료` property. This Files property is the guaranteed path for detecting a material added to an old class; a PDF block embedded only in the page body is supplemental and is read only when that page is already a processing candidate. For every current PDF, the curator can render every page as an image in one collapsed `슬라이드 미리보기` toggle, captioned `파일명 · 슬라이드 N`. It replaces only its own prior previews when the source changes and leaves user images untouched.
+Alt's current public API exposes note metadata, transcripts, and summaries, but not raw PDF attachments. If a PDF must be read directly and cited by page, attach it once to the matching Notion class page's `수업 자료` property. This Files property is the guaranteed path for detecting a material added to an old class; a PDF block embedded only in the page body is supplemental and is read only when that page is already a processing candidate. For every current PDF, the curator renders every page as an image and places it directly after the paragraph that explains or references that slide, captioned `파일명 · 슬라이드 N`. The result is one top-to-bottom reading flow rather than a detached gallery. It replaces only its own prior inline images when the source changes and leaves user images untouched.
+
+If a recording was missed but the class page has a readable PDF, the curator can create a material-only note. It uses only slide-supported claims and does not invent instructor remarks, corrections, or announcements. If an Alt source appears later, the same note is rebuilt from both sources.
 
 If Alt regenerated a summary from slides, that summary can still arrive through the normal source-ingestion path, but it is not a substitute for direct file access. In Alt desktop 0.10.1, the import path accepts PDF rather than PPT/PPTX, so export slides to PDF first; later Alt releases may differ.
 
