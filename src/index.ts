@@ -40,6 +40,7 @@ interface AltWebhookEvent {
     transcript_status?: string;
     summary_status?: string;
     source_layout_version?: number;
+    ended_at?: string | null;
   };
 }
 
@@ -145,6 +146,14 @@ type PendingEventRow = Record<string, SqlStorageValue> & {
   event_id: string;
   event_json: string;
   attempts: number;
+  created_at: number;
+};
+
+type PendingUnendedEventRow = Record<string, SqlStorageValue> & {
+  event_id: string;
+  event_json: string;
+  attempts: number;
+  created_at: number;
 };
 
 type NoteStateRow = Record<string, SqlStorageValue> & {
@@ -240,6 +249,9 @@ const RECONCILE_FAILURE_RETRY_MS = 5 * 60 * 1000;
 const MAX_RECONCILE_PAGES = 25;
 const MAX_FULL_RECONCILE_PAGES = 25;
 const SOURCE_LAYOUT_VERSION = 4;
+const MAX_UNENDED_EVENT_ATTEMPTS = 10;
+const MAX_UNENDED_EVENT_AGE_MS = 24 * 60 * 60 * 1000;
+const UNENDED_EVENT_DRAIN_VERSION = "1";
 const MANUAL_NOTES_HEADING = "직접 필기";
 const SOURCE_SYNC_HEADING = "원본 동기화";
 const LEGACY_AI_NOTES_HEADING = "AI 수업 노트";
@@ -399,6 +411,31 @@ export class SyncCoordinator extends DurableObject<Env> {
           value TEXT NOT NULL
         )
       `);
+      const unendedDrainVersion = Array.from(
+        sql.exec<ValueRow>(
+          `SELECT value FROM sync_state WHERE key = ?`,
+          "unended_event_drain_version",
+        ),
+      )[0]?.value;
+      if (unendedDrainVersion !== UNENDED_EVENT_DRAIN_VERSION) {
+        const now = Date.now();
+        const migrated = makeStalePendingUnendedEventsDue(
+          this.ctx.storage,
+          now,
+        );
+        if (migrated > 0) {
+          const currentAlarm = await this.ctx.storage.getAlarm();
+          if (currentAlarm == null || currentAlarm > now) {
+            await this.ctx.storage.setAlarm(now);
+          }
+        }
+        sql.exec(
+          `INSERT INTO sync_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          "unended_event_drain_version",
+          UNENDED_EVENT_DRAIN_VERSION,
+        );
+      }
       const errorRedactionVersion = Array.from(
         sql.exec<ValueRow>(
           `SELECT value FROM sync_state WHERE key = ?`,
@@ -562,7 +599,7 @@ export class SyncCoordinator extends DurableObject<Env> {
     await this.fullReconcileIfDue(now);
     const rows = Array.from(
       this.ctx.storage.sql.exec<PendingEventRow>(
-        `SELECT event_id, event_json, attempts
+        `SELECT event_id, event_json, attempts, created_at
          FROM events
          WHERE status = 'pending' AND available_at <= ?
          ORDER BY available_at ASC, created_at ASC
@@ -585,8 +622,33 @@ export class SyncCoordinator extends DurableObject<Env> {
         );
       } catch (error) {
         const attempts = row.attempts + 1;
-        const retryAt = Date.now() + retryDelayMs(attempts);
+        const attemptedAt = Date.now();
         const errorCode = operationalErrorCode(error);
+        if (
+          shouldStopRetryingUnendedEvent(
+            errorCode,
+            attempts,
+            row.created_at,
+            attemptedAt,
+          )
+        ) {
+          this.ctx.storage.sql.exec(
+            `UPDATE events
+             SET status = 'processed', attempts = ?, processed_at = ?,
+                 last_error = ?
+             WHERE event_id = ?`,
+            attempts,
+            attemptedAt,
+            errorCode,
+            row.event_id,
+          );
+          console.warn("Alt event stopped after persistent missing end time", {
+            attempts,
+            errorCode,
+          });
+          continue;
+        }
+        const retryAt = attemptedAt + retryDelayMs(attempts);
         this.ctx.storage.sql.exec(
           `UPDATE events
            SET attempts = ?, available_at = ?, last_error = ?
@@ -767,20 +829,108 @@ export class SyncCoordinator extends DurableObject<Env> {
   }
 }
 
-function insertPendingEvents(
+export function isInventoryReconciliationEvent(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const value = event as {
+    event_id?: unknown;
+    data?: { source_layout_version?: unknown };
+  };
+  return (
+    typeof value.event_id === "string" &&
+    value.event_id.startsWith("reconcile:") &&
+    Number.isSafeInteger(value.data?.source_layout_version) &&
+    Number(value.data?.source_layout_version) >= 1
+  );
+}
+
+export function shouldStopRetryingUnendedEvent(
+  errorCode: string,
+  attempts: number,
+  createdAt: number,
+  now: number,
+): boolean {
+  if (errorCode !== "alt_note_not_ended") return false;
+  if (Number.isFinite(attempts) && attempts >= MAX_UNENDED_EVENT_ATTEMPTS) {
+    return true;
+  }
+  return (
+    Number.isFinite(createdAt) &&
+    Number.isFinite(now) &&
+    now - createdAt >= MAX_UNENDED_EVENT_AGE_MS
+  );
+}
+
+export function makeStalePendingUnendedEventsDue(
+  storage: DurableObjectStorage,
+  now: number,
+): number {
+  const rows = Array.from(
+    storage.sql.exec<PendingUnendedEventRow>(
+      `SELECT event_id, event_json, attempts, created_at
+       FROM events
+       WHERE status = 'pending' AND last_error = ?`,
+      "alt_note_not_ended",
+    ),
+  );
+  let migrated = 0;
+  for (const row of rows) {
+    try {
+      const event = JSON.parse(row.event_json) as unknown;
+      if (
+        (event as { event_id?: unknown }).event_id !== row.event_id ||
+        (!isInventoryReconciliationEvent(event) &&
+          !shouldStopRetryingUnendedEvent(
+            "alt_note_not_ended",
+            row.attempts,
+            row.created_at,
+            now,
+          ))
+      ) {
+        continue;
+      }
+      storage.sql.exec(
+        `UPDATE events
+         SET available_at = ?
+         WHERE event_id = ? AND status = 'pending' AND last_error = ?`,
+        now,
+        row.event_id,
+        "alt_note_not_ended",
+      );
+      migrated += 1;
+    } catch {
+      // Malformed and still-young webhook rows retain their retry schedule.
+    }
+  }
+  return migrated;
+}
+
+export function insertPendingEvents(
   storage: DurableObjectStorage,
   events: AltWebhookEvent[],
   now: number,
 ): void {
   for (const event of events) {
+    const eventJson = JSON.stringify(event);
     storage.sql.exec(
-      `INSERT OR IGNORE INTO events
+      `INSERT INTO events
        (event_id, event_json, status, attempts, available_at, created_at)
-       VALUES (?, ?, 'pending', 0, ?, ?)`,
+       VALUES (?, ?, 'pending', 0, ?, ?)
+       ON CONFLICT(event_id) DO UPDATE SET
+         event_json = excluded.event_json,
+         status = 'pending',
+         attempts = 0,
+         available_at = excluded.available_at,
+         created_at = excluded.created_at,
+         processed_at = NULL,
+         last_error = NULL
+       WHERE events.status = 'processed'
+         AND ? = 1
+         AND events.event_json <> excluded.event_json`,
       event.event_id,
-      JSON.stringify(event),
+      eventJson,
       now,
       now,
+      isInventoryReconciliationEvent(event) ? 1 : 0,
     );
   }
 }
@@ -1047,6 +1197,8 @@ export function reconcileEventForNote(note: AltNote): AltWebhookEvent | null {
   let eventType: AltEventType;
   if (note.status === "deleted") {
     eventType = "note.deleted";
+  } else if (!note.ended_at) {
+    return null;
   } else if (note.status === "ended" && note.summary_status === "ready") {
     eventType = "note.summary.generated";
   } else if (note.status === "ended" && note.transcript_status === "ready") {
@@ -1065,6 +1217,7 @@ export function reconcileEventForNote(note: AltNote): AltWebhookEvent | null {
       transcript_status: note.transcript_status,
       summary_status: note.summary_status,
       source_layout_version: SOURCE_LAYOUT_VERSION,
+      ended_at: note.ended_at ?? null,
       reason: note.status === "deleted" ? "deleted" : null,
     },
   };
@@ -1465,6 +1618,7 @@ async function processAltEvent(
     return;
   }
   if (!note.ended_at) {
+    if (isInventoryReconciliationEvent(event)) return;
     throw new Error(`Alt note ${noteId} has no ended_at timestamp`);
   }
   if (

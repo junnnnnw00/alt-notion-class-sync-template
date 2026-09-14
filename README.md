@@ -88,6 +88,7 @@ Existing pages remain compatible. On the next real curation trigger, the curator
 
 - Matching uses the timetable's local calendar day, course-title similarity, and actual time overlap.
 - Ambiguous recordings remain unmatched instead of being written to a guessed page.
+- Inventory entries without an Alt `ended_at` timestamp are not guessed into a calendar slot. PDF-only material still flows through the separate Notion/Codex curation path. A genuine live webhook whose detail is briefly incomplete retries for up to 10 attempts or 24 hours; a later Alt update or inventory record with a real end time creates a fresh processing opportunity.
 - Webhook event IDs and note revisions make retries idempotent.
 - A Durable Object alarm checks recent changes without a Cron Trigger.
 - Every 24 hours by default, the same alarm pages through the complete Alt note list with deletion tombstones enabled. A stored active or unmatched note missing from a successfully completed inventory is handled as `access_lost`.

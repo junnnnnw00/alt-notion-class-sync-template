@@ -9,7 +9,10 @@ import {
   deletedSourceToggleChildBlocks,
   fullInventoryQueryPath,
   inspectSourceHeadingLayout,
+  insertPendingEvents,
+  isInventoryReconciliationEvent,
   koreaDayBounds,
+  makeStalePendingUnendedEventsDue,
   missingInventoryDeletionEvents,
   notionAutoNoteEnabled,
   operationalErrorCode,
@@ -19,6 +22,7 @@ import {
   shouldProcessRevision,
   shouldProcessStoredRevision,
   shouldRetryMissingAltContent,
+  shouldStopRetryingUnendedEvent,
   skippedAutoNoteState,
   sourceReplacementAnchor,
   sourceToggleChildBlocks,
@@ -165,6 +169,7 @@ describe("public health response", () => {
       "Alt note private-note-id failed on private-page-id: provider detail";
     const syncState = new Map<string, string>([
       ["error_redaction_version", "1"],
+      ["unended_event_drain_version", "1"],
     ]);
     const sql = {
       exec(query: string, ...bindings: unknown[]): unknown[] {
@@ -282,6 +287,7 @@ describe("operational error privacy", () => {
     const syncState = new Map<string, string>([
       ["next_reconcile_at", String(future)],
       ["next_full_reconcile_at", String(future)],
+      ["unended_event_drain_version", "1"],
     ]);
     let storedLastError: string | null = null;
     let legacyRedaction: string | null = null;
@@ -309,6 +315,7 @@ describe("operational error privacy", () => {
                 data: { note_id: noteId, revision: 1 },
               }),
               attempts: 0,
+              created_at: now,
             },
           ];
         }
@@ -364,6 +371,101 @@ describe("operational error privacy", () => {
     } finally {
       nowSpy.mockRestore();
       consoleSpy.mockRestore();
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("stops a persistently unended live event after bounded retries", async () => {
+    const now = Date.parse("2030-01-15T06:00:00.000Z");
+    const future = now + 60 * 60_000;
+    const eventId = "webhook-stale-unended";
+    const noteId = "note-stale-unended";
+    const syncState = new Map<string, string>([
+      ["next_reconcile_at", String(future)],
+      ["next_full_reconcile_at", String(future)],
+      ["error_redaction_version", "1"],
+      ["unended_event_drain_version", "1"],
+    ]);
+    let processedUpdate: unknown[] | null = null;
+    const sql = {
+      exec(query: string, ...bindings: unknown[]): unknown[] {
+        if (query.includes("SELECT value FROM sync_state WHERE key = ?")) {
+          const value = syncState.get(String(bindings[0]));
+          return value == null ? [] : [{ value }];
+        }
+        if (
+          query.includes("SELECT event_id, event_json, attempts, created_at") &&
+          query.includes("available_at <= ?")
+        ) {
+          return [
+            {
+              event_id: eventId,
+              event_json: JSON.stringify({
+                event_id: eventId,
+                event_type: "note.updated",
+                occurred_at: "2030-01-14T05:00:00.000Z",
+                data: { note_id: noteId, revision: 1 },
+              }),
+              attempts: 9,
+              created_at: now - 25 * 60 * 60 * 1000,
+            },
+          ];
+        }
+        if (
+          query.includes("SET status = 'processed', attempts = ?, processed_at = ?")
+        ) {
+          processedUpdate = bindings;
+          return [];
+        }
+        if (query.includes("SELECT MIN(available_at) AS available_at")) {
+          return [{ available_at: null }];
+        }
+        return [];
+      },
+    };
+    const durableObjectState = {
+      storage: {
+        sql,
+        getAlarm: async () => null,
+        setAlarm: async (_scheduledTime: number) => undefined,
+      },
+      blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+      waitUntil: (_promise: Promise<unknown>) => undefined,
+    } as unknown as ConstructorParameters<typeof SyncCoordinator>[0];
+    const env = {
+      ALT_API_KEY: "test-alt-api-key",
+      NOTION_API_TOKEN: "notion_test",
+    } as unknown as ConstructorParameters<typeof SyncCoordinator>[1];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        id: noteId,
+        revision: 1,
+        title: "PDF-only note",
+        status: "ended",
+        transcript_status: "ready",
+        summary_status: "ready",
+        ended_at: null,
+        updated_at: "2030-01-14T05:00:00.000Z",
+      }),
+    );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+
+    try {
+      const coordinator = new SyncCoordinator(durableObjectState, env);
+      await coordinator.alarm();
+
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(processedUpdate).toEqual([
+        10,
+        now,
+        "alt_note_not_ended",
+        eventId,
+      ]);
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(noteId);
+    } finally {
+      nowSpy.mockRestore();
+      warnSpy.mockRestore();
       fetchSpy.mockRestore();
     }
   });
@@ -914,6 +1016,7 @@ describe("missed-event reconciliation", () => {
         transcript_status: "ready",
         summary_status: "ready",
         source_layout_version: 4,
+        ended_at: readyNote.ended_at,
         reason: null,
       },
     });
@@ -937,6 +1040,161 @@ describe("missed-event reconciliation", () => {
         summary_status: "pending",
       }),
     ).toBeNull();
+  });
+
+  it("does not enqueue inventory notes that have no usable end time", () => {
+    expect(reconcileEventForNote({ ...readyNote, ended_at: null })).toBeNull();
+  });
+
+  it("recognizes only internally reconciled events with both markers", () => {
+    const internalEvent = reconcileEventForNote(readyNote)!;
+    expect(isInventoryReconciliationEvent(internalEvent)).toBe(true);
+    expect(
+      isInventoryReconciliationEvent({
+        ...internalEvent,
+        event_id: "webhook-event",
+      }),
+    ).toBe(false);
+    expect(
+      isInventoryReconciliationEvent({
+        ...internalEvent,
+        data: { ...internalEvent.data, source_layout_version: undefined },
+      }),
+    ).toBe(false);
+  });
+
+  it("makes internal and stale webhook unended retries due immediately", () => {
+    const now = Date.parse("2030-01-15T06:00:00.000Z");
+    const internalEvent = reconcileEventForNote(readyNote)!;
+    const genuineWebhook = {
+      ...internalEvent,
+      event_id: "webhook-event",
+      data: { ...internalEvent.data, source_layout_version: undefined },
+    };
+    const updates: unknown[][] = [];
+    const storage = {
+      sql: {
+        exec(query: string, ...bindings: unknown[]): unknown[] {
+          if (query.includes("SELECT event_id, event_json")) {
+            return [
+              {
+                event_id: internalEvent.event_id,
+                event_json: JSON.stringify(internalEvent),
+                attempts: 1,
+                created_at: now,
+              },
+              {
+                event_id: "row-event-id-does-not-match-payload",
+                event_json: JSON.stringify(internalEvent),
+                attempts: 27,
+                created_at: now - 4 * 24 * 60 * 60 * 1000,
+              },
+              {
+                event_id: genuineWebhook.event_id,
+                event_json: JSON.stringify(genuineWebhook),
+                attempts: 27,
+                created_at: now - 4 * 24 * 60 * 60 * 1000,
+              },
+              {
+                event_id: "young-webhook",
+                event_json: JSON.stringify({
+                  ...genuineWebhook,
+                  event_id: "young-webhook",
+                }),
+                attempts: 1,
+                created_at: now,
+              },
+              {
+                event_id: "malformed",
+                event_json: "{",
+                attempts: 27,
+                created_at: now - 4 * 24 * 60 * 60 * 1000,
+              },
+            ];
+          }
+          if (query.includes("UPDATE events")) updates.push(bindings);
+          return [];
+        },
+      },
+    } as unknown as Parameters<typeof makeStalePendingUnendedEventsDue>[0];
+
+    expect(makeStalePendingUnendedEventsDue(storage, now)).toBe(2);
+    expect(updates).toEqual([
+      [now, internalEvent.event_id, "alt_note_not_ended"],
+      [now, genuineWebhook.event_id, "alt_note_not_ended"],
+    ]);
+  });
+
+  it("bounds missing-end-time retries without stopping other failures", () => {
+    const now = Date.parse("2030-01-15T06:00:00.000Z");
+    expect(
+      shouldStopRetryingUnendedEvent(
+        "alt_note_not_ended",
+        10,
+        now - 60_000,
+        now,
+      ),
+    ).toBe(true);
+    expect(
+      shouldStopRetryingUnendedEvent(
+        "alt_note_not_ended",
+        1,
+        now - 24 * 60 * 60 * 1000,
+        now,
+      ),
+    ).toBe(true);
+    expect(
+      shouldStopRetryingUnendedEvent(
+        "alt_note_not_ended",
+        2,
+        now - 60_000,
+        now,
+      ),
+    ).toBe(false);
+    expect(
+      shouldStopRetryingUnendedEvent(
+        "provider_unavailable",
+        99,
+        now - 7 * 24 * 60 * 60 * 1000,
+        now,
+      ),
+    ).toBe(false);
+  });
+
+  it("requeues a changed processed inventory event but never a live webhook", () => {
+    const now = Date.parse("2030-01-15T06:00:00.000Z");
+    const internalEvent = reconcileEventForNote(readyNote)!;
+    const genuineWebhook: Parameters<typeof insertPendingEvents>[1][number] = {
+      ...internalEvent,
+      event_id: "webhook-event",
+      data: { ...internalEvent.data, source_layout_version: undefined },
+    };
+    const calls: Array<{ query: string; bindings: unknown[] }> = [];
+    const storage = {
+      sql: {
+        exec(query: string, ...bindings: unknown[]): unknown[] {
+          calls.push({ query, bindings });
+          return [];
+        },
+      },
+    } as unknown as Parameters<typeof insertPendingEvents>[0];
+
+    insertPendingEvents(storage, [internalEvent, genuineWebhook], now);
+
+    expect(calls).toHaveLength(2);
+    expect(internalEvent.data.ended_at).toBe(readyNote.ended_at);
+    const { ended_at: _legacyMissingEndTime, ...legacyData } = internalEvent.data;
+    const legacyProcessedJson = JSON.stringify({
+      ...internalEvent,
+      data: legacyData,
+    });
+    expect(JSON.stringify(internalEvent)).not.toBe(legacyProcessedJson);
+    expect(calls[0].query).toContain("events.status = 'processed'");
+    expect(calls[0].query).toContain(
+      "events.event_json <> excluded.event_json",
+    );
+    expect(calls[0].bindings.at(-1)).toBe(1);
+    expect(calls[1].bindings.at(-1)).toBe(0);
   });
 
   it("migrates an equal revision to layout v4 once", () => {
@@ -1007,6 +1265,7 @@ describe("missed-event reconciliation", () => {
     const retryAt = now + 5 * 60_000;
     const syncState = new Map<string, string>([
       ["next_reconcile_at", String(retryAt)],
+      ["unended_event_drain_version", "1"],
     ]);
     const alarms: number[] = [];
     const sql = {

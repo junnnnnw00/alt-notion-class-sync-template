@@ -140,6 +140,8 @@ https://<worker>.<subdomain>.workers.dev/health
 
 The three credentials and coordinator should be configured. `pendingEvents` and `unmatchedNotes` should normally settle to zero. When events are waiting, `oldestPendingCreatedAt`, `nextPendingAttemptAt`, `maxPendingAttempts`, and the allowlisted `pendingErrorCounts` distinguish normal backoff from a stuck queue without exposing event IDs, note/page IDs, payloads, or raw errors. `lastFullReconciledAt` records the most recent complete inventory and `fullScanInProgress` shows a retrying pass. `hasReconcileError` and `hasFullReconcileError` signal reconciliation failures without exposing private error messages publicly.
 
+An Alt inventory item with no `ended_at` value cannot be matched to a recurring class safely, so reconciliation does not queue it. This is expected for some PDF-only notes: attach or discover the PDF through the separate curator path instead. A genuine live webhook whose note detail is temporarily missing `ended_at` retries for up to 10 attempts or 24 hours. If Alt later supplies an end time, a new webhook or changed inventory record can process it normally.
+
 Finish with a short test recording during a class slot. Confirm that the matching Notion class page contains:
 
 ```text
