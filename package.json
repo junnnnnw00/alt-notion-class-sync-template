@@ -10,6 +10,7 @@
   "type": "module",
   "scripts": {
     "setup": "node scripts/setup.mjs",
+    "alt:inspect": "node scripts/inspect-local-alt.mjs",
     "dev": "wrangler dev --config wrangler.local.jsonc",
     "deploy": "wrangler deploy --config wrangler.local.jsonc",
     "tail": "wrangler tail --config wrangler.local.jsonc",

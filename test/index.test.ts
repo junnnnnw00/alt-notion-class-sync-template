@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   SyncCoordinator,
+  canonicalSourceSectionHeadings,
   chooseClassCandidate,
   collectFullAltNoteInventory,
   deletionMarkerNeeded,
   deletedNoteState,
   deletedSourceToggleChildBlocks,
   fullInventoryQueryPath,
+  inspectSourceHeadingLayout,
   koreaDayBounds,
   missingInventoryDeletionEvents,
   notionAutoNoteEnabled,
@@ -42,6 +44,18 @@ function blockText(block: { type: string; [key: string]: unknown }): string {
     rich_text?: Array<{ text?: { content?: string } }>;
   };
   return value.rich_text?.[0]?.text?.content ?? "";
+}
+
+function headingBlock(
+  type: "heading_1" | "heading_2" | "heading_3",
+  id: string,
+  text: string,
+): { id: string; type: string; [key: string]: unknown } {
+  return {
+    id,
+    type,
+    [type]: { rich_text: [{ plain_text: text }] },
+  };
 }
 
 describe("Alt webhook verification", () => {
@@ -445,6 +459,65 @@ describe("Notion output", () => {
     expect(blockText(withSummary[2])).toBe("핵심 개념");
   });
 
+  it.each(["heading_1", "heading_2", "heading_3"] as const)(
+    "recognizes an existing %s source heading",
+    (type) => {
+      const layout = inspectSourceHeadingLayout([
+        headingBlock(type, "source-heading", "원본 동기화"),
+      ]);
+
+      expect(layout.sourceHeading).toMatchObject({
+        id: "source-heading",
+        type,
+      });
+    },
+  );
+
+  it("creates new manual and source headings in canonical H2 form", () => {
+    const headings = canonicalSourceSectionHeadings(true);
+
+    expect(headings.map((block) => block.type)).toEqual([
+      "heading_2",
+      "heading_2",
+    ]);
+    expect(headings.map(blockText)).toEqual(["직접 필기", "원본 동기화"]);
+  });
+
+  it("places a new H2 source section after all nested content of a manual section", () => {
+    const layout = inspectSourceHeadingLayout([
+      headingBlock("heading_1", "manual", "직접 필기"),
+      { id: "intro", type: "paragraph", paragraph: { rich_text: [] } },
+      headingBlock("heading_2", "manual-subsection", "세부 필기"),
+      { id: "last-manual", type: "paragraph", paragraph: { rich_text: [] } },
+      headingBlock("heading_1", "next-section", "다른 섹션"),
+    ]);
+
+    expect(layout.manualHeading).toMatchObject({
+      id: "manual",
+      type: "heading_1",
+    });
+    expect(layout.manualInsertionAnchorId).toBe("last-manual");
+  });
+
+  it("distinguishes empty and non-empty legacy sections across heading levels", () => {
+    const empty = inspectSourceHeadingLayout([
+      headingBlock("heading_3", "legacy", "AI 수업 노트"),
+      headingBlock("heading_2", "next-section", "다른 섹션"),
+    ]);
+    const nonEmpty = inspectSourceHeadingLayout([
+      headingBlock("heading_1", "legacy", "AI 수업 노트"),
+      headingBlock("heading_2", "legacy-subsection", "기존 내용"),
+      headingBlock("heading_1", "next-section", "다른 섹션"),
+    ]);
+
+    expect(empty.legacyHeading).toMatchObject({
+      id: "legacy",
+      type: "heading_3",
+    });
+    expect(empty.legacySectionIsEmpty).toBe(true);
+    expect(nonEmpty.legacySectionIsEmpty).toBe(false);
+  });
+
   it("defaults automatic notes on only when no checkbox is configured", () => {
     expect(notionAutoNoteEnabled({}, undefined)).toBe(true);
     expect(
@@ -509,7 +582,7 @@ describe("Notion output", () => {
       stagedContainerId: null,
       stagedRevision: null,
       revision: 10,
-      sourceLayoutVersion: 3,
+      sourceLayoutVersion: 4,
       summaryIncluded: false,
       deleted: true,
       updatedAt: "after",
@@ -563,7 +636,7 @@ describe("Notion output", () => {
         stagedContainerId: null,
         stagedRevision: null,
         revision: 9,
-        sourceLayoutVersion: 3,
+        sourceLayoutVersion: 4,
         summaryIncluded: false,
         deleted: false,
         updatedAt: "before",
@@ -688,7 +761,7 @@ describe("missed-event reconciliation", () => {
         revision: 9,
         deleted: 1,
         container_id: "deletion-marker",
-        source_layout_version: 3,
+        source_layout_version: 4,
         updated_at: "2030-01-15T05:00:00.000Z",
       },
       {
@@ -744,7 +817,7 @@ describe("missed-event reconciliation", () => {
 
   it("turns a summary-ready note into a deterministic summary event", () => {
     expect(reconcileEventForNote(readyNote)).toEqual({
-      event_id: "reconcile:v3:note-example:7:note.summary.generated",
+      event_id: "reconcile:v4:note-example:7:note.summary.generated",
       event_type: "note.summary.generated",
       occurred_at: readyNote.updated_at,
       data: {
@@ -752,7 +825,7 @@ describe("missed-event reconciliation", () => {
         revision: 7,
         transcript_status: "ready",
         summary_status: "ready",
-        source_layout_version: 3,
+        source_layout_version: 4,
         reason: null,
       },
     });
@@ -778,33 +851,33 @@ describe("missed-event reconciliation", () => {
     ).toBeNull();
   });
 
-  it("migrates an equal revision to layout v3 once", () => {
-    expect(shouldProcessRevision(7, 2, 7, "note.updated", 3)).toBe(true);
-    expect(shouldProcessRevision(7, 3, 7, "note.updated", 3)).toBe(false);
+  it("migrates an equal revision to layout v4 once", () => {
+    expect(shouldProcessRevision(7, 3, 7, "note.updated", 4)).toBe(true);
+    expect(shouldProcessRevision(7, 4, 7, "note.updated", 4)).toBe(false);
   });
 
   it("reprocesses an active note at the same revision after a deletion marker", () => {
     expect(
-      shouldProcessStoredRevision(true, 7, 3, 7, "note.updated", 3, false),
+      shouldProcessStoredRevision(true, 7, 4, 7, "note.updated", 4, false),
     ).toBe(true);
     expect(
-      shouldProcessStoredRevision(false, 7, 3, 7, "note.updated", 3, false),
+      shouldProcessStoredRevision(false, 7, 4, 7, "note.updated", 4, false),
     ).toBe(false);
     expect(
-      shouldProcessStoredRevision(true, 7, 3, 6, "note.updated", 3, false),
+      shouldProcessStoredRevision(true, 7, 4, 6, "note.updated", 4, false),
     ).toBe(false);
   });
 
   it("adds a same-revision summary once and then deduplicates it", () => {
     expect(
-      shouldProcessRevision(7, 3, 7, "note.summary.generated", 3, false),
+      shouldProcessRevision(7, 4, 7, "note.summary.generated", 4, false),
     ).toBe(true);
     expect(
-      shouldProcessRevision(7, 3, 7, "note.summary.generated", 3, true),
+      shouldProcessRevision(7, 4, 7, "note.summary.generated", 4, true),
     ).toBe(false);
   });
 
-  it("retries a v3 migration when Alt detail data is transiently behind", () => {
+  it("retries a v4 migration when Alt detail data is transiently behind", () => {
     const pendingDetail = {
       transcript_status: "pending" as const,
       summary_status: "pending" as const,
@@ -812,7 +885,7 @@ describe("missed-event reconciliation", () => {
     expect(
       shouldRetryMissingAltContent(pendingDetail, {
         event_type: "note.updated",
-        data: { source_layout_version: 3 },
+        data: { source_layout_version: 4 },
       }),
     ).toBe(true);
     expect(

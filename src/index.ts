@@ -227,7 +227,10 @@ const DEFAULT_FULL_RECONCILE_INTERVAL_HOURS = 24;
 const RECONCILE_FAILURE_RETRY_MS = 5 * 60 * 1000;
 const MAX_RECONCILE_PAGES = 25;
 const MAX_FULL_RECONCILE_PAGES = 25;
-const SOURCE_LAYOUT_VERSION = 3;
+const SOURCE_LAYOUT_VERSION = 4;
+const MANUAL_NOTES_HEADING = "직접 필기";
+const SOURCE_SYNC_HEADING = "원본 동기화";
+const LEGACY_AI_NOTES_HEADING = "AI 수업 노트";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1714,7 +1717,7 @@ async function syncDeletedSourceMarker(
   if (!markerNeeded || !deletedState.pageId) return;
 
   const pageId = deletedState.pageId;
-  const headingId = await findOrCreateAiNotesHeading(pageId, env);
+  const headingId = await findOrCreateSourceHeading(pageId, env);
   deletedState.headingId = headingId;
   deletedState.updatedAt = new Date().toISOString();
   upsertNoteState(noteId, deletedState, storage);
@@ -1796,11 +1799,13 @@ async function syncLecturePage(
   env: Env,
   storage: DurableObjectStorage,
 ): Promise<void> {
-  const headingId = await findOrCreateAiNotesHeading(candidate.pageId, env);
+  const headingId = await findOrCreateSourceHeading(candidate.pageId, env);
   const insertionAnchorId = await findSourceReplacementAnchor(
     candidate.pageId,
     headingId,
-    previousState?.containerId ?? null,
+    previousState?.sourceLayoutVersion === SOURCE_LAYOUT_VERSION
+      ? previousState.containerId
+      : null,
     env,
   );
   const stagedState: NoteState = {
@@ -1962,10 +1967,81 @@ function nestedSummaryBlocks(markdown: string): NotionBlock[] {
   });
 }
 
-async function findOrCreateAiNotesHeading(
+type NotionHeadingType = "heading_1" | "heading_2" | "heading_3";
+
+interface SourcePageHeading {
+  id: string;
+  type: NotionHeadingType;
+  index: number;
+  level: number;
+}
+
+export function inspectSourceHeadingLayout(
+  topLevelBlocks: NotionBlock[],
+): {
+  sourceHeading: SourcePageHeading | null;
+  manualHeading: SourcePageHeading | null;
+  manualInsertionAnchorId: string | null;
+  legacyHeading: SourcePageHeading | null;
+  legacySectionIsEmpty: boolean;
+} {
+  const headings = topLevelBlocks.flatMap((block, index) => {
+    if (!block.id || !/^heading_[123]$/.test(block.type)) return [];
+    const type = block.type as NotionHeadingType;
+    const value = block[type] as { rich_text?: NotionRichText[] } | undefined;
+    return [{
+      id: block.id,
+      type,
+      index,
+      level: Number(type.at(-1)),
+      text: plainText(value?.rich_text),
+    }];
+  });
+  const sourceHeading =
+    headings.find(({ text }) => text === SOURCE_SYNC_HEADING) ?? null;
+  const manualHeading =
+    headings.find(({ text }) => text === MANUAL_NOTES_HEADING) ?? null;
+  const legacyHeading =
+    headings.find(({ text }) => text === LEGACY_AI_NOTES_HEADING) ?? null;
+
+  const sectionEnd = (heading: (typeof headings)[number]): number =>
+    headings.find(
+      ({ index, level }) => index > heading.index && level <= heading.level,
+    )?.index ?? topLevelBlocks.length;
+  const manualSectionEnd = manualHeading ? sectionEnd(manualHeading) : null;
+  const manualInsertionIndex =
+    manualSectionEnd == null ? null : manualSectionEnd - 1;
+  const manualInsertionAnchorId =
+    manualInsertionIndex == null
+      ? null
+      : topLevelBlocks[manualInsertionIndex]?.id ?? manualHeading?.id ?? null;
+  const legacySectionIsEmpty = Boolean(
+    legacyHeading && sectionEnd(legacyHeading) - 1 === legacyHeading.index,
+  );
+
+  return {
+    sourceHeading,
+    manualHeading,
+    manualInsertionAnchorId,
+    legacyHeading,
+    legacySectionIsEmpty,
+  };
+}
+
+export function canonicalSourceSectionHeadings(
+  includeManualHeading: boolean,
+): NotionBlock[] {
+  const titles = includeManualHeading
+    ? [MANUAL_NOTES_HEADING, SOURCE_SYNC_HEADING]
+    : [SOURCE_SYNC_HEADING];
+  return titles.map((title) => makeTextBlock("heading_2", title));
+}
+
+async function findOrCreateSourceHeading(
   pageId: string,
   env: Env,
 ): Promise<string> {
+  const topLevelBlocks: NotionBlock[] = [];
   let cursor: string | undefined;
   do {
     const query = new URLSearchParams({ page_size: "100" });
@@ -1975,21 +2051,59 @@ async function findOrCreateAiNotesHeading(
       has_more: boolean;
       next_cursor: string | null;
     }>(`/blocks/${pageId}/children?${query.toString()}`, env);
-    for (const block of response.results) {
-      if (!block.id || !block.type.startsWith("heading_")) continue;
-      const value = block[block.type] as { rich_text?: NotionRichText[] } | undefined;
-      if (plainText(value?.rich_text) === "AI 수업 노트") return block.id;
-    }
+    topLevelBlocks.push(...response.results);
     cursor = response.has_more ? response.next_cursor ?? undefined : undefined;
   } while (cursor);
 
+  const layout = inspectSourceHeadingLayout(topLevelBlocks);
+  const sourceHeading = layout.sourceHeading;
+  if (sourceHeading) return sourceHeading.id;
+
+  const manualHeading = layout.manualHeading;
+  if (manualHeading) {
+    const insertionAnchor = layout.manualInsertionAnchorId ?? manualHeading.id;
+    const created = await appendTopLevelBlocks(
+      pageId,
+      insertionAnchor,
+      canonicalSourceSectionHeadings(false),
+      env,
+    );
+    const headingId = created[0];
+    if (!headingId) throw new Error(`Could not create source heading on ${pageId}`);
+    return headingId;
+  }
+
+  const legacyHeading = layout.legacyHeading;
+
+  if (legacyHeading && layout.legacySectionIsEmpty) {
+    const replacementHeading = makeTextBlock(
+      legacyHeading.type,
+      MANUAL_NOTES_HEADING,
+    );
+    await notionRequest(`/blocks/${legacyHeading.id}`, env, {
+      method: "PATCH",
+      body: JSON.stringify({
+        [legacyHeading.type]: replacementHeading[legacyHeading.type],
+      }),
+    });
+    const created = await appendTopLevelBlocks(
+      pageId,
+      legacyHeading.id,
+      canonicalSourceSectionHeadings(false),
+      env,
+    );
+    const headingId = created[0];
+    if (!headingId) throw new Error(`Could not create source heading on ${pageId}`);
+    return headingId;
+  }
+
   const created = await appendChildBlocks(
     pageId,
-    [makeTextBlock("heading_2", "AI 수업 노트")],
+    canonicalSourceSectionHeadings(true),
     env,
   );
-  const headingId = created[0];
-  if (!headingId) throw new Error(`Could not create AI notes heading on ${pageId}`);
+  const headingId = created[1];
+  if (!headingId) throw new Error(`Could not create source heading on ${pageId}`);
   return headingId;
 }
 

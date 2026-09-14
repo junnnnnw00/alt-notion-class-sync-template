@@ -20,7 +20,7 @@ Use a separate integration for this project so it can be revoked without affecti
 
 Do not add transcript text, note titles, page URLs, headers, request bodies, or provider error bodies to public health responses or production logs.
 
-Alt's public API does not expose raw slide attachments. Do not scrape private Alt endpoints, reuse session cookies, or guess attachment URLs. The optional Codex layer reads only PDFs explicitly available on an authorized Notion class page. Temporary Notion download URLs must never be stored in markers, logs, fixtures, or Git; compute material fingerprints from file bytes and discard temporary downloads after processing.
+Alt's public API does not expose raw slide attachments. Do not scrape private Alt endpoints, reuse session cookies, or guess attachment URLs. The durable Codex workflow reads PDFs explicitly available on an authorized Notion class page. An operator may explicitly run the optional same-Mac local inspector, which reads Alt Desktop's private database and PDF storage without writing to them or accessing its local server token; its note metadata and absolute PDF paths remain private output and must not be committed or logged. Temporary Notion download URLs must never be stored in markers, logs, fixtures, or Git; compute material fingerprints from file bytes and discard temporary downloads after processing.
 
 ## Retention and deletion
 
