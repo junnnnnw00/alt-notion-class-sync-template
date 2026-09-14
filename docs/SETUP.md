@@ -138,7 +138,7 @@ Open:
 https://<worker>.<subdomain>.workers.dev/health
 ```
 
-The three credentials and coordinator should be configured. `pendingEvents` and `unmatchedNotes` should normally settle to zero. `lastFullReconciledAt` records the most recent complete inventory and `fullScanInProgress` shows a retrying pass. `hasReconcileError` and `hasFullReconcileError` signal problems without exposing private error messages publicly.
+The three credentials and coordinator should be configured. `pendingEvents` and `unmatchedNotes` should normally settle to zero. When events are waiting, `oldestPendingCreatedAt`, `nextPendingAttemptAt`, `maxPendingAttempts`, and the allowlisted `pendingErrorCounts` distinguish normal backoff from a stuck queue without exposing event IDs, note/page IDs, payloads, or raw errors. `lastFullReconciledAt` records the most recent complete inventory and `fullScanInProgress` shows a retrying pass. `hasReconcileError` and `hasFullReconcileError` signal reconciliation failures without exposing private error messages publicly.
 
 Finish with a short test recording during a class slot. Confirm that the matching Notion class page contains:
 

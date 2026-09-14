@@ -95,7 +95,7 @@ Existing pages remain compatible. On the next real curation trigger, the curator
 - Every Alt `note.deleted` event removes the Worker-managed transcript and summary. This includes both an explicit deletion and `access_lost`, as required by [Alt's webhook guidance](https://www.altalt.io/en/developers/webhooks#check-for-missed-changes). The replacement `원본 자료` toggle contains only `Alt · 삭제됨 · revision N`; it has no note ID, title, or source text.
 - User-authored blocks and page properties are not removed by that cleanup.
 
-`GET /health` reports configuration flags, counts, timestamps, `lastFullReconciledAt`, `fullScanInProgress`, and boolean incremental/full reconciliation error flags. Raw error text is intentionally omitted from the public response.
+`GET /health` reports configuration flags, counts, timestamps, `lastFullReconciledAt`, `fullScanInProgress`, and boolean incremental/full reconciliation error flags. It also exposes privacy-safe queue aggregates (`oldestPendingCreatedAt`, `nextPendingAttemptAt`, `maxPendingAttempts`, and allowlisted `pendingErrorCounts`) so a delayed retry can be distinguished from a stuck queue. Event IDs, note/page IDs, payloads, and raw error text are intentionally omitted from the public response.
 
 ## Optional Codex curation
 

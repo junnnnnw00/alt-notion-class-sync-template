@@ -173,6 +173,18 @@ type CountRow = Record<string, SqlStorageValue> & {
   count: number;
 };
 
+type PendingQueueStatsRow = Record<string, SqlStorageValue> & {
+  pending_events: number;
+  oldest_created_at: number | null;
+  next_attempt_at: number | null;
+  max_attempts: number | null;
+};
+
+type PendingErrorCountRow = Record<string, SqlStorageValue> & {
+  error_code: string;
+  count: number;
+};
+
 type ValueRow = Record<string, SqlStorageValue> & {
   value: string;
 };
@@ -414,11 +426,26 @@ export class SyncCoordinator extends DurableObject<Env> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/status") {
-      const pendingEvents = Array.from(
-        this.ctx.storage.sql.exec<CountRow>(
-          `SELECT COUNT(*) AS count FROM events WHERE status = 'pending'`,
+      const pendingQueue = Array.from(
+        this.ctx.storage.sql.exec<PendingQueueStatsRow>(
+          `SELECT COUNT(*) AS pending_events,
+                  MIN(created_at) AS oldest_created_at,
+                  MIN(available_at) AS next_attempt_at,
+                  MAX(attempts) AS max_attempts
+           FROM events
+           WHERE status = 'pending'`,
         ),
-      )[0]?.count ?? 0;
+      )[0];
+      const pendingErrorCounts = safePendingErrorCounts(
+        Array.from(
+          this.ctx.storage.sql.exec<PendingErrorCountRow>(
+            `SELECT last_error AS error_code, COUNT(*) AS count
+             FROM events
+             WHERE status = 'pending' AND last_error IS NOT NULL
+             GROUP BY last_error`,
+          ),
+        ),
+      );
       const unmatchedNotes = Array.from(
         this.ctx.storage.sql.exec<CountRow>(
           `SELECT COUNT(*) AS count FROM unmatched`,
@@ -439,7 +466,13 @@ export class SyncCoordinator extends DurableObject<Env> {
       const fullScanId = this.getSyncState("full_scan_id");
       const sourceLayoutVersion = this.getSyncState("source_layout_version");
       return jsonResponse({
-        pendingEvents,
+        pendingEvents: pendingQueue?.pending_events ?? 0,
+        oldestPendingCreatedAt: timestampToIso(
+          pendingQueue?.oldest_created_at,
+        ),
+        nextPendingAttemptAt: timestampToIso(pendingQueue?.next_attempt_at),
+        maxPendingAttempts: pendingQueue?.max_attempts ?? 0,
+        pendingErrorCounts,
         unmatchedNotes,
         lastReconciledAt,
         nextReconcileAt:
@@ -1113,6 +1146,9 @@ export function operationalErrorCode(error: unknown): string {
     if (/Could not create AI notes heading on /.test(message)) {
       return "notion_ai_heading_failed";
     }
+    if (/Could not create source heading on /.test(message)) {
+      return "notion_source_heading_failed";
+    }
     if (/^(Missing|Invalid) (event|revision|source layout version)/.test(message)) {
       return "stored_event_invalid";
     }
@@ -1252,6 +1288,68 @@ function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
 
 class UnmatchedNoteError extends Error {}
 
+const PUBLIC_OPERATIONAL_ERROR_CODES = new Set([
+  "alt_content_not_ready",
+  "alt_inventory_cursor_invalid",
+  "alt_inventory_limit_reached",
+  "alt_inventory_response_invalid",
+  "alt_note_not_ended",
+  "alt_revision_mismatch",
+  "class_match_requires_review",
+  "full_scan_state_invalid",
+  "internal_error",
+  "legacy_error_redacted",
+  "notion_ai_heading_failed",
+  "notion_deletion_marker_failed",
+  "notion_note_container_failed",
+  "notion_source_heading_failed",
+  "provider_authentication_failed",
+  "provider_conflict",
+  "provider_network_error",
+  "provider_payload_too_large",
+  "provider_rate_limited",
+  "provider_request_failed",
+  "provider_request_rejected",
+  "provider_resource_not_found",
+  "provider_response_invalid",
+  "provider_timeout",
+  "provider_unavailable",
+  "stored_event_invalid",
+]);
+
+function timestampToIso(value: unknown): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function safePendingErrorCountEntries(
+  entries: Iterable<readonly [unknown, unknown]>,
+): Record<string, number> {
+  const counts = new Map<string, number>();
+  for (const [rawCode, rawCount] of entries) {
+    if (typeof rawCount !== "number" || !Number.isFinite(rawCount)) continue;
+    const count = Math.trunc(rawCount);
+    if (count <= 0) continue;
+    const code =
+      typeof rawCode === "string" && PUBLIC_OPERATIONAL_ERROR_CODES.has(rawCode)
+        ? rawCode
+        : "redacted_error";
+    counts.set(code, (counts.get(code) ?? 0) + count);
+  }
+  return Object.fromEntries([...counts.entries()].sort(([left], [right]) =>
+    left.localeCompare(right),
+  ));
+}
+
+function safePendingErrorCounts(
+  rows: Iterable<PendingErrorCountRow>,
+): Record<string, number> {
+  return safePendingErrorCountEntries(
+    Array.from(rows, (row) => [row.error_code, row.count] as const),
+  );
+}
+
 export async function purgeUnmatchedBeforeDeletedSourceSync(
   storage: DurableObjectStorage,
   noteId: string,
@@ -1263,15 +1361,27 @@ export async function purgeUnmatchedBeforeDeletedSourceSync(
 
 export function publicSyncStatus(sync: unknown): unknown {
   if (!sync || typeof sync !== "object" || Array.isArray(sync)) return sync;
-  const { lastReconcileError, lastFullReconcileError, ...safe } = sync as Record<
-    string,
-    unknown
-  >;
-  return {
+  const {
+    lastReconcileError,
+    lastFullReconcileError,
+    pendingErrorCounts,
+    ...safe
+  } = sync as Record<string, unknown>;
+  const status: Record<string, unknown> = {
     ...safe,
     hasReconcileError: Boolean(lastReconcileError),
     hasFullReconcileError: Boolean(lastFullReconcileError),
   };
+  if (
+    pendingErrorCounts &&
+    typeof pendingErrorCounts === "object" &&
+    !Array.isArray(pendingErrorCounts)
+  ) {
+    status.pendingErrorCounts = safePendingErrorCountEntries(
+      Object.entries(pendingErrorCounts as Record<string, unknown>),
+    );
+  }
+  return status;
 }
 
 async function processAltEvent(

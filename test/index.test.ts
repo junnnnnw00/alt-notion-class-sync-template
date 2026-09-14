@@ -127,21 +127,105 @@ describe("Alt webhook verification", () => {
 
 describe("public health response", () => {
   it("replaces raw incremental and full reconciliation errors with booleans", () => {
+    const privateError = "private note title: API failed for user@example.com";
     expect(
       publicSyncStatus({
         pendingEvents: 1,
+        pendingErrorCounts: {
+          alt_content_not_ready: 2,
+          [privateError]: 1,
+        },
         lastReconcileError: "sensitive note title: API failed",
         lastFullReconcileError: "another sensitive error",
       }),
     ).toEqual({
       pendingEvents: 1,
+      pendingErrorCounts: {
+        alt_content_not_ready: 2,
+        redacted_error: 1,
+      },
       hasReconcileError: true,
       hasFullReconcileError: true,
     });
+    expect(
+      JSON.stringify(
+        publicSyncStatus({ pendingErrorCounts: { [privateError]: 1 } }),
+      ),
+    ).not.toContain(privateError);
     expect(publicSyncStatus({ lastReconcileError: null })).toEqual({
       hasReconcileError: false,
       hasFullReconcileError: false,
     });
+  });
+
+  it("reports only aggregate pending-queue diagnostics", async () => {
+    const oldestCreatedAt = Date.parse("2030-01-15T05:45:00.000Z");
+    const nextAttemptAt = Date.parse("2030-01-15T06:05:00.000Z");
+    const privateError =
+      "Alt note private-note-id failed on private-page-id: provider detail";
+    const syncState = new Map<string, string>([
+      ["error_redaction_version", "1"],
+    ]);
+    const sql = {
+      exec(query: string, ...bindings: unknown[]): unknown[] {
+        if (query.includes("SELECT value FROM sync_state WHERE key = ?")) {
+          const value = syncState.get(String(bindings[0]));
+          return value == null ? [] : [{ value }];
+        }
+        if (query.includes("COUNT(*) AS pending_events")) {
+          return [
+            {
+              pending_events: 3,
+              oldest_created_at: oldestCreatedAt,
+              next_attempt_at: nextAttemptAt,
+              max_attempts: 4,
+            },
+          ];
+        }
+        if (query.includes("GROUP BY last_error")) {
+          return [
+            { error_code: "alt_content_not_ready", count: 2 },
+            { error_code: privateError, count: 1 },
+          ];
+        }
+        if (query.includes("SELECT COUNT(*) AS count FROM unmatched")) {
+          return [{ count: 0 }];
+        }
+        return [];
+      },
+    };
+    const durableObjectState = {
+      storage: { sql },
+      blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+      waitUntil: (_promise: Promise<unknown>) => undefined,
+    } as unknown as ConstructorParameters<typeof SyncCoordinator>[0];
+    const coordinator = new SyncCoordinator(
+      durableObjectState,
+      {} as ConstructorParameters<typeof SyncCoordinator>[1],
+    );
+
+    const response = await coordinator.fetch(
+      new Request("https://sync-coordinator.internal/status"),
+    );
+    const internalStatus = await response.json();
+    const publicStatus = publicSyncStatus(internalStatus);
+
+    expect(publicStatus).toMatchObject({
+      pendingEvents: 3,
+      oldestPendingCreatedAt: "2030-01-15T05:45:00.000Z",
+      nextPendingAttemptAt: "2030-01-15T06:05:00.000Z",
+      maxPendingAttempts: 4,
+      pendingErrorCounts: {
+        alt_content_not_ready: 2,
+        redacted_error: 1,
+      },
+      hasReconcileError: false,
+      hasFullReconcileError: false,
+    });
+    const serialized = JSON.stringify(publicStatus);
+    expect(serialized).not.toContain("private-note-id");
+    expect(serialized).not.toContain("private-page-id");
+    expect(serialized).not.toContain("provider detail");
   });
 });
 
@@ -159,12 +243,16 @@ describe("operational error privacy", () => {
       operationalErrorCode(
         new Error(`Could not create note container on ${pageId}`),
       ),
+      operationalErrorCode(
+        new Error(`Could not create source heading on ${pageId}`),
+      ),
       operationalErrorCode(new Error(providerMessage)),
     ];
 
     expect(results).toEqual([
       "alt_content_not_ready",
       "notion_note_container_failed",
+      "notion_source_heading_failed",
       "internal_error",
     ]);
     expect(JSON.stringify(results)).not.toContain(noteId);
